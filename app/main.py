@@ -4,7 +4,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Quer
 from fastapi.middleware.cors import CORSMiddleware
 from app.websocket.connection_manager import manager
 from app.session_manager import DBSessionManager
-from app.models import Table, Player, GameState, CardDeck, CardColor
+from app.models import GameStatus, PlayerRole, Table, Player, GameState, CardDeck, CardColor
 from app.database.database import get_db
 from app.repositories.table_repository import TableRepository
 from app.repositories.player_repository import PlayerRepository
@@ -69,9 +69,16 @@ async def websocket_table_endpoint(
         return
 
     # Check player in table
-    if not any(p.id == player.id for p in table.players):
+        is_spectator = table_player.role == PlayerRole.SPECTATOR
+
+    # Connect using the fixed connection manager
+    table_player = table.get_player(str(player.id))
+    if not table_player:
         await websocket.close(code=1008, reason="Player not in this table")
         return
+        
+    # Check if player is a spectator
+    is_spectator = table_player.role == PlayerRole.SPECTATOR
 
     # Connect using the fixed connection manager
     await manager.connect(websocket, session_token, table_id, db_session_manager)
@@ -79,7 +86,11 @@ async def websocket_table_endpoint(
     try:
         # ===== CRITICAL FIX: MINIMAL STATE SENDING =====
         # Only send essential state without triggering any events
-        
+        await manager.send_personal_message({
+            "type": "role_assigned",
+            "data": {"role": "spectator" if is_spectator else "player"}
+        }, websocket)
+
         game_state_repo = GameStateRepository(db)
         game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
         
@@ -89,22 +100,31 @@ async def websocket_table_endpoint(
             
             # Get fresh table data
             fresh_table = await table_repo.get_table(uuid.UUID(table_id))
+            if is_spectator:
+                # Spectators get public state only
+                public_state = game_state.to_public_dict(fresh_table)
+                await manager.send_personal_message({
+                    "type": "game_state",
+                    "data": public_state
+                }, websocket)
+            else:
+                # Players get full state including their hand
+                public_state = game_state.to_public_dict(fresh_table)
+                await manager.send_personal_message({
+                    "type": "game_state",
+                    "data": public_state
+                }, websocket)
+
             
-            # Send current game state
-            public_state = game_state_to_public_dict(game_state, fresh_table)
-            await manager.send_personal_message({
-                "type": "game_state",
-                "data": public_state
-            }, websocket)
 
             # Send player's current hand
-            player_repo = PlayerRepository(db)
-            fresh_player = await player_repo.get_player(player.id)
-            if fresh_player and fresh_player.hand:
-                await manager.send_personal_message({
-                    "type": "your_hand", 
-                    "data": [card_to_dict(card) for card in fresh_player.hand]
-                }, websocket)
+                player_repo = PlayerRepository(db)
+                fresh_player = await player_repo.get_player(player.id)
+                if fresh_player and fresh_player.hand:
+                    await manager.send_personal_message({
+                        "type": "your_hand", 
+                        "data": [card_to_dict(card) for card in fresh_player.hand]
+                    }, websocket)
         else:
             print(f"WEBSOCKET: Game not in progress, sending minimal state to {player.username}")
             
@@ -115,11 +135,13 @@ async def websocket_table_endpoint(
                     "table_id": table_id,
                     "status": "waiting",
                     "player_count": len(table.players),
-                    "players": [{"id": str(p.id), "username": p.username} for p in table.players]
+                    "spectator_count": len(table.spectators),
+                    "players": [{"id": str(p.id), "username": p.username} for p in table.players],
+                    "spectators": [{"id": str(s.id), "username": s.username} for s in table.spectators]
                 }
             }, websocket)
 
-        print(f"WEBSOCKET: {player.username} connected successfully to table {table_id}")
+        print(f"WEBSOCKET: {player.username} connected as {'spectator' if is_spectator else 'player'} to table {table_id}")
 
         # ===== MESSAGE HANDLING LOOP =====
         while True:
@@ -128,6 +150,13 @@ async def websocket_table_endpoint(
                 message = json.loads(data)
                 message_type = message.get("type")
                 
+                # Prevent spectators from performing game actions
+                if is_spectator and message_type in ["play_card", "draw_card", "start_game", "declare_uno", "challenge_uno"]:
+                    await manager.send_personal_message({
+                        "type": "error",
+                        "data": {"message": "Spectators cannot perform game actions"}
+                    }, websocket)
+                    continue
                 print(f"WEBSOCKET: Received {message_type} from {player.username}")
 
                 if message_type == "ping":
@@ -175,6 +204,13 @@ async def websocket_table_endpoint(
                     print(f"GAME ACTION: Draw card result: {result.get('success', False)}")
 
                 elif message_type == "start_game":
+
+                    if is_spectator:
+                        await manager.send_personal_message({
+                            "type": "error",
+                            "data": {"message": "Spectators cannot start games"}
+                        }, websocket)
+                        continue
                     print(f"GAME ACTION: {player.username} starting game")
                     
                     result = await GameActionHandler.handle_start_game(table_id, player, db=db)
@@ -240,6 +276,43 @@ async def websocket_table_endpoint(
 @app.get("/")
 async def root():
     return {"message": "Uno Game Server is running"}
+@app.get("/tables/{table_id}", response_model=dict)
+async def get_table(table_id: str, db: AsyncSession = Depends(get_db)):
+    table_repo = TableRepository(db)
+    game_state_repo = GameStateRepository(db)
+
+    table = await table_repo.get_table(uuid.UUID(table_id))
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
+
+    game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
+
+    # Create a response that excludes player hands
+    table_response = {
+        "id": str(table.id),
+        "name": table.name,
+        "players": [{
+            "id": str(p.id),
+            "username": p.username,
+            "hand_count": len(p.hand),
+            "is_online": p.is_online,
+            "role": p.role.value if hasattr(p, 'role') else "player"
+        } for p in table.players],
+        "spectators": [{
+            "id": str(s.id),
+            "username": s.username,
+            "is_online": s.is_online,
+            "role": "spectator"
+        } for s in table.spectators],
+        "max_players": table.max_players,
+        "status": table.status.value,
+        "created_at": table.created_at
+    }
+
+    return {
+        "table": table_response,
+        "game_state": game_state_to_public_dict(game_state, table) if game_state else {}
+    }
 
 @app.get("/tables", response_model=list)
 async def list_tables(db: AsyncSession = Depends(get_db)):
@@ -262,19 +335,38 @@ async def join_table(table_id: str, username: str, db: AsyncSession = Depends(ge
     if not table:
         raise HTTPException(status_code=404, detail="Table not found")
     
-    # Check if table is full
-    if len(table.players) >= table.max_players:
-        raise HTTPException(status_code=400, detail="Table is full")
+    # Check if game is already in progress
+    game_state_repo = GameStateRepository(db)
+    game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
     
     # Create a new player
     player = Player(username=username)
     
-    # Add player to table
-    table.add_player(player)
+    role = PlayerRole.PLAYER
+    if game_state and game_state.status == GameStatus.IN_PROGRESS:
+        # Join as spectator if game is in progress
+        role = PlayerRole.SPECTATOR
+        # Spectators don't get cards
+        player.hand = []
+    else:
+        # Join as player if game hasn't started
+        if len(table.players) >= table.max_players:
+            raise HTTPException(status_code=400, detail="Table is full")
+        # Regular players get an empty hand (will be dealt cards when game starts)
+        player.hand = []
+    
+    player.role = role
     
     # Update database
     player_repo = PlayerRepository(db)
     await player_repo.create_player(player, uuid.UUID(table_id))
+    
+    # Add to appropriate list based on role
+    if role == PlayerRole.SPECTATOR:
+        table.spectators.append(player)
+    else:
+        table.players.append(player)
+    
     await table_repo.update_table(table)
     
     # Create a session for the player
@@ -284,24 +376,10 @@ async def join_table(table_id: str, username: str, db: AsyncSession = Depends(ge
     return {
         "player_id": str(player.id),
         "session_token": session_token,
-        "table_id": table_id
+        "table_id": table_id,
+        "role": role.value
     }
 
-@app.get("/tables/{table_id}", response_model=dict)
-async def get_table(table_id: str, db: AsyncSession = Depends(get_db)):
-    table_repo = TableRepository(db)
-    game_state_repo = GameStateRepository(db)
-
-    table = await table_repo.get_table(uuid.UUID(table_id))
-    if not table:
-        raise HTTPException(status_code=404, detail="Table not found")
-
-    game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
-
-    return {
-        "table": table.dict(exclude={"players": {"__all__": {"hand"}}}),
-        "game_state": game_state_to_public_dict(game_state, table)
-    }
 
 @app.post("/tables", response_model=dict)
 async def create_table(name: str, max_players: int = 10, db: AsyncSession = Depends(get_db)):

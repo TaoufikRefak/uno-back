@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
 from app.database.models import TableModel, PlayerModel, GameStateModel
-from app.models import Table, Player, GameState, Card
+from app.models import PlayerRole, Table, Player, GameState, Card
 from typing import List, Optional
 import uuid
 import time
@@ -30,6 +30,7 @@ class TableRepository:
             id=table_id,
             name=name,
             players=[],
+            spectators=[],  # Initialize empty spectators list
             max_players=max_players,
             status=table_model.status,
             created_at=table_model.created_at
@@ -44,34 +45,43 @@ class TableRepository:
         if not table_model:
             return None
         
-        # Get players
+        # Get all players for this table
         result = await self.db.execute(
             select(PlayerModel).where(PlayerModel.table_id == table_id)
         )
         player_models = result.scalars().all()
         
         players = []
+        spectators = []
         for player_model in player_models:
             hand = [Card(**card) for card in player_model.hand]
-            players.append(Player(
+            player = Player(
                 id=player_model.id,
                 username=player_model.username,
                 hand=hand,
                 is_online=player_model.is_online,
-                uno_declaration=player_model.uno_declaration
-            ))
+                uno_declaration=player_model.uno_declaration,
+                role=player_model.role  # Make sure to include role
+            )
+            
+            # Separate players and spectators based on role
+            if player_model.role == PlayerRole.SPECTATOR:
+                spectators.append(player)
+            else:
+                players.append(player)
         
         return Table(
             id=table_model.id,
             name=table_model.name,
             players=players,
+            spectators=spectators,  # Include spectators
             max_players=table_model.max_players,
             status=table_model.status,
             created_at=table_model.created_at
         )
     
     async def update_table(self, table: Table):
-    # Update table metadata
+        # Update table metadata
         await self.db.execute(
             update(TableModel)
             .where(TableModel.id == table.id)
@@ -81,8 +91,8 @@ class TableRepository:
             )
         )
         
-        # Update players
-        for player in table.players:
+        # Update players (both regular players and spectators)
+        for player in table.players + table.spectators:
             hand_data = [card.dict() for card in player.hand]
             await self.db.execute(
                 update(PlayerModel)
@@ -90,7 +100,8 @@ class TableRepository:
                 .values(
                     hand=hand_data,
                     is_online=player.is_online,
-                    uno_declaration=player.uno_declaration
+                    uno_declaration=player.uno_declaration,
+                    role=player.role  # Update role as well
                 )
             )
         

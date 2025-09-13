@@ -4,7 +4,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 import enum
 import uuid
-
+from app.models import PlayerRole
 Base = declarative_base()
 
 class CardColor(str, enum.Enum):
@@ -58,6 +58,7 @@ class PlayerModel(Base):
     is_online = Column(Boolean, default=True)
     uno_declaration = Column(Enum(UnoDeclarationState), default=UnoDeclarationState.NOT_REQUIRED)
     table_id = Column(UUID(as_uuid=True), ForeignKey("tables.id"))
+    role = Column(Enum(PlayerRole), default=PlayerRole.PLAYER)  # Add this
     
     table = relationship("TableModel", back_populates="players")
     sessions = relationship("SessionModel", back_populates="player")

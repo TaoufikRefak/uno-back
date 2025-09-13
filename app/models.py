@@ -130,7 +130,9 @@ class CardDeck:
 
 
 
-
+class PlayerRole(str, Enum):
+    PLAYER = "player"
+    SPECTATOR = "spectator"
 
 class Player(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -140,7 +142,7 @@ class Player(BaseModel):
     is_online: bool = True
     has_uno: bool = Field(default=False)
     uno_declaration: UnoDeclarationState = UnoDeclarationState.NOT_REQUIRED
-    
+    role: PlayerRole = PlayerRole.PLAYER  # Add this field
     # Updated config for Pydantic V2
     model_config = ConfigDict(extra='ignore')
     
@@ -186,6 +188,7 @@ class Table(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     name: str
     players: List[Player] = Field(default_factory=list)
+    spectators: List[Player] = Field(default_factory=list)  # Add spectators list
     max_players: int = Field(default=10, ge=2, le=10)
     status: GameStatus = GameStatus.WAITING
     created_at: float = Field(default_factory=lambda: time.time())
@@ -197,6 +200,11 @@ class Table(BaseModel):
             return True
         return False
     
+    def add_spectator(self, player: Player) -> bool:
+        """Add a spectator to the table"""
+        self.spectators.append(player)
+        return True
+    
     def remove_player(self, player_id: UUID) -> bool:
         """Remove a player from the table"""
         for i, player in enumerate(self.players):
@@ -205,16 +213,31 @@ class Table(BaseModel):
                 return True
         return False
     
+    def remove_spectator(self, player_id: UUID) -> bool:
+        """Remove a spectator from the table"""
+        for i, spectator in enumerate(self.spectators):
+            if spectator.id == player_id:
+                self.spectators.pop(i)
+                return True
+        return False
+    
     def get_player(self, player_id: str) -> Optional[Player]:
-        """Get a player by ID string"""
+        """Get a player by ID string (checks both players and spectators)"""
         try:
             player_uuid = UUID(player_id)
         except ValueError:
             return None
             
+        # Check players first
         for player in self.players:
             if player.id == player_uuid:
                 return player
+                
+        # Check spectators
+        for spectator in self.spectators:
+            if spectator.id == player_uuid:
+                return spectator
+                
         return None
 
 class GameState(BaseModel):
@@ -229,7 +252,7 @@ class GameState(BaseModel):
     last_action: Optional[Dict[str, Any]] = None
     
     def initialize_game(self, table: Table):
-        """Initialize a new game"""
+        """Initialize a new game - only deal cards to players, not spectators"""
         self.status = GameStatus.IN_PROGRESS
         self.winner = None
         self.current_player_index = 0
@@ -238,7 +261,7 @@ class GameState(BaseModel):
         # Create and shuffle the deck
         self.draw_pile = CardDeck.shuffle(CardDeck.create_deck())
         
-        # Deal 7 cards to each player
+        # Deal 7 cards to each player (not spectators)
         for player in table.players:
             drawn_cards, self.draw_pile = CardDeck.draw_cards(self.draw_pile, 7)
             player.hand = drawn_cards
@@ -325,34 +348,35 @@ class GameState(BaseModel):
         return len(player.hand) == 0
     
     def to_public_dict(self, table: Table, requesting_player: Optional[Player] = None) -> Dict[str, Any]:
-        """Return a public representation of the game state with minimal opponent info"""
+        """Return a public representation of the game state"""
         current_player = self.get_current_player(table)
         top_card = self.get_top_discard_card()
         
-        # Create player info with minimal details for opponents
+        # Create player info
         players_info = []
         for player in table.players:
-            if requesting_player and player.id == requesting_player.id:
-                # Full info for the requesting player
-                player_info = {
-                    "id": str(player.id),
-                    "username": player.username,
-                    "hand_count": len(player.hand),
-                    "is_online": player.is_online,
-                    "is_you": True,
-                    "uno_declaration": player.uno_declaration.value
-                }
-            else:
-                # Minimal info for opponents
-                player_info = {
-                    "id": str(player.id),
-                    "username": player.username,
-                    "hand_count": len(player.hand),
-                    "is_online": player.is_online,
-                    "is_you": False,
-                    "uno_declaration": player.uno_declaration.value
-                }
+            player_info = {
+                "id": str(player.id),
+                "username": player.username,
+                "hand_count": len(player.hand),
+                "is_online": player.is_online,
+                "is_you": requesting_player and player.id == requesting_player.id,
+                "uno_declaration": player.uno_declaration.value,
+                "role": player.role.value if hasattr(player, 'role') else "player"
+            }
             players_info.append(player_info)
+        
+        # Create spectator info (limited details)
+        spectators_info = []
+        for spectator in table.spectators:
+            spectator_info = {
+                "id": str(spectator.id),
+                "username": spectator.username,
+                "is_online": spectator.is_online,
+                "is_you": requesting_player and spectator.id == requesting_player.id,
+                "role": "spectator"
+            }
+            spectators_info.append(spectator_info)
         
         return {
             "table_id": str(self.table_id),
@@ -363,5 +387,6 @@ class GameState(BaseModel):
             "status": self.status.value,
             "winner_id": str(self.winner) if self.winner else None,
             "players": players_info,
+            "spectators": spectators_info,
             "last_action": self.last_action
         }

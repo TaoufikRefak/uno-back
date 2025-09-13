@@ -5,7 +5,7 @@ from app.repositories.game_state_repository import GameStateRepository
 from app.repositories.player_repository import PlayerRepository
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models import GameState, Table, Player, Card, CardColor, GameStatus, UnoDeclarationState, CardType
+from app.models import GameState, PlayerRole, Table, Player, Card, CardColor, GameStatus, UnoDeclarationState, CardType
 from app.websocket.connection_manager import manager
 from app.session_manager import DBSessionManager as session_manager
 from app.websocket.event_handler import (
@@ -32,7 +32,10 @@ class GameActionHandler:
         chosen_color: Optional[CardColor] = None,
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
-        """Handle a player playing a card - FIXED VERSION"""
+        # Check if player is a spectator
+        if hasattr(player, 'role') and player.role == PlayerRole.SPECTATOR:
+            return {"success": False, "error": "Spectators cannot play cards"}
+        
         table_repo = TableRepository(db)
         game_state_repo = GameStateRepository(db)
         player_repo = PlayerRepository(db)
@@ -254,7 +257,10 @@ class GameActionHandler:
         player: Player,
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
-        """Handle a player drawing a card - FIXED VERSION"""
+        # Check if player is a spectator
+        if hasattr(player, 'role') and player.role == PlayerRole.SPECTATOR:
+            return {"success": False, "error": "Spectators cannot draw cards"}
+        
         table_repo = TableRepository(db)
         game_state_repo = GameStateRepository(db)
         player_repo = PlayerRepository(db)
@@ -327,7 +333,10 @@ class GameActionHandler:
         player: Player,
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
-        """Handle a player declaring UNO - FIXED VERSION"""
+        # Check if player is a spectator
+        if hasattr(player, 'role') and player.role == PlayerRole.SPECTATOR:
+            return {"success": False, "error": "Spectators cannot declare UNO"}
+        
         table_repo = TableRepository(db)
         
         table = await table_repo.get_table(uuid.UUID(table_id))
@@ -363,7 +372,10 @@ class GameActionHandler:
         target_player_id: str,
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
-        """Handle a player challenging another player for not declaring UNO - FIXED VERSION"""
+        # Check if challenger is a spectator
+        if hasattr(challenger, 'role') and challenger.role == PlayerRole.SPECTATOR:
+            return {"success": False, "error": "Spectators cannot challenge UNO"}
+        
         table_repo = TableRepository(db)
         game_state_repo = GameStateRepository(db)
         
