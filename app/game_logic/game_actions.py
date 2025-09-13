@@ -243,27 +243,19 @@ class GameActionHandler:
         if not drawn_cards:
             return {"success": False, "error": "No cards to draw"}
 
-        # Broadcast card drawn event
+        # Update database FIRST
+        await table_repo.update_table(table)
+        await game_state_repo.update_game_state(game_state)
+
+        # Then broadcast events
         await broadcast_card_drawn(
             table_id, 
             str(player.id), 
             player.username, 
             len(drawn_cards),
-            len(player.hand)  # Pass the hand count here
+            len(player.hand)
         )
         
-        # If player now has 1 card after drawing, set PENDING
-        if len(player.hand) == 1:
-            player.uno_declaration = UnoDeclarationState.PENDING
-            await broadcast_player_one_card(table_id, str(player.id), player.username)
-
-        # Record last action
-        game_state.last_action = {
-            "type": "card_drawn",
-            "player_id": str(player.id),
-            "timestamp": time.time()
-        }
-
         # Send the drawn card only to the player
         await manager.send_to_player({
             "type": "card_drawn",
@@ -280,8 +272,7 @@ class GameActionHandler:
         new_current_player = game_state.get_current_player(table)
         await broadcast_turn_changed(str(table.id), str(new_current_player.id), new_current_player.username)
         
-        # Update database
-        await table_repo.update_table(table)
+        # Update database again with new turn
         await game_state_repo.update_game_state(game_state)
 
         # Broadcast the updated game state to everyone
@@ -291,7 +282,7 @@ class GameActionHandler:
         }, str(table.id))
 
         return {"success": True, "drawn_count": len(drawn_cards)}
-    
+        
     
 
 
