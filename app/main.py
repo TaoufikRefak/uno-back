@@ -24,8 +24,6 @@ async def on_startup():
     from app.database.init_db import init_db
     await init_db()
 
-
-# Configure CORS
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
@@ -46,8 +44,6 @@ async def websocket_test_endpoint(websocket: WebSocket):
             await websocket.send_text(f"Message received: {data}")
     except WebSocketDisconnect:
         print("Client disconnected")
-
-
 
 @app.websocket("/ws/table/{table_id}")
 async def websocket_table_endpoint(
@@ -77,56 +73,73 @@ async def websocket_table_endpoint(
         await websocket.close(code=1008, reason="Player not in this table")
         return
 
-    # Remove old connections and connect with session manager
+    # Connect using the fixed connection manager
     await manager.connect(websocket, session_token, table_id, db_session_manager)
 
     try:
-        # Fetch game state from DB
+        # ===== CRITICAL FIX: MINIMAL STATE SENDING =====
+        # Only send essential state without triggering any events
+        
         game_state_repo = GameStateRepository(db)
         game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
-        if game_state:
-            public_state = game_state_to_public_dict(game_state, table)
+        
+        # ONLY send state if game is actually in progress
+        if game_state and game_state.status.value == "in_progress":
+            print(f"WEBSOCKET: Sending game state to {player.username}")
+            
+            # Get fresh table data
+            fresh_table = await table_repo.get_table(uuid.UUID(table_id))
+            
+            # Send current game state
+            public_state = game_state_to_public_dict(game_state, fresh_table)
             await manager.send_personal_message({
                 "type": "game_state",
                 "data": public_state
             }, websocket)
 
-        # Send player's hand
-        player_repo = PlayerRepository(db)
-        player = await player_repo.get_player(player.id)  # refresh hand from DB
-        await manager.send_personal_message({
-            "type": "your_hand",
-            "data": [card_to_dict(card) for card in player.hand]
-        }, websocket)
+            # Send player's current hand
+            player_repo = PlayerRepository(db)
+            fresh_player = await player_repo.get_player(player.id)
+            if fresh_player and fresh_player.hand:
+                await manager.send_personal_message({
+                    "type": "your_hand", 
+                    "data": [card_to_dict(card) for card in fresh_player.hand]
+                }, websocket)
+        else:
+            print(f"WEBSOCKET: Game not in progress, sending minimal state to {player.username}")
+            
+            # For waiting games, send minimal info
+            await manager.send_personal_message({
+                "type": "table_info",
+                "data": {
+                    "table_id": table_id,
+                    "status": "waiting",
+                    "player_count": len(table.players),
+                    "players": [{"id": str(p.id), "username": p.username} for p in table.players]
+                }
+            }, websocket)
 
-        # Broadcast join
-        await manager.broadcast_to_table({
-            "type": "player_joined",
-            "data": {
-                "player_id": str(player.id),
-                "username": player.username,
-                "hand_count": len(player.hand),
-                "is_online": True
-            }
-        }, table_id, exclude=websocket)
+        print(f"WEBSOCKET: {player.username} connected successfully to table {table_id}")
 
-        # Listen for messages
+        # ===== MESSAGE HANDLING LOOP =====
         while True:
             try:
                 data = await websocket.receive_text()
                 message = json.loads(data)
-                print(f"Received message: {message['type']} from player {player.id}")
+                message_type = message.get("type")
+                
+                print(f"WEBSOCKET: Received {message_type} from {player.username}")
 
-                if message["type"] == "ping":
+                if message_type == "ping":
                     await manager.send_personal_message({
                         "type": "pong",
                         "data": {"timestamp": time.time()}
                     }, websocket)
 
-                # Game actions now pass `db` to update DB
-                elif message["type"] == "play_card":
+                elif message_type == "play_card":
                     card_index = message.get("card_index")
                     chosen_color = message.get("chosen_color")
+                    
                     if card_index is None:
                         await manager.send_personal_message({
                             "type": "error",
@@ -134,38 +147,56 @@ async def websocket_table_endpoint(
                         }, websocket)
                         continue
 
+                    print(f"GAME ACTION: {player.username} playing card {card_index}")
+                    
                     result = await GameActionHandler.handle_play_card(
                         table_id, player, card_index,
                         CardColor(chosen_color) if chosen_color else None,
                         db=db
                     )
+                    
                     await manager.send_personal_message({
                         "type": "play_card_result",
                         "data": result
                     }, websocket)
+                    
+                    print(f"GAME ACTION: Play card result: {result.get('success', False)}")
 
-                elif message["type"] == "draw_card":
+                elif message_type == "draw_card":
+                    print(f"GAME ACTION: {player.username} drawing card")
+                    
                     result = await GameActionHandler.handle_draw_card(table_id, player, db=db)
+                    
                     await manager.send_personal_message({
                         "type": "draw_card_result",
                         "data": result
                     }, websocket)
+                    
+                    print(f"GAME ACTION: Draw card result: {result.get('success', False)}")
 
-                elif message["type"] == "start_game":
+                elif message_type == "start_game":
+                    print(f"GAME ACTION: {player.username} starting game")
+                    
                     result = await GameActionHandler.handle_start_game(table_id, player, db=db)
+                    
                     await manager.send_personal_message({
                         "type": "start_game_result",
                         "data": result
                     }, websocket)
+                    
+                    print(f"GAME ACTION: Start game result: {result.get('success', False)}")
 
-                elif message["type"] == "declare_uno":
+                elif message_type == "declare_uno":
+                    print(f"GAME ACTION: {player.username} declaring UNO")
+                    
                     result = await GameActionHandler.handle_declare_uno(table_id, player, db=db)
+                    
                     await manager.send_personal_message({
                         "type": "declare_uno_result",
                         "data": result
                     }, websocket)
 
-                elif message["type"] == "challenge_uno":
+                elif message_type == "challenge_uno":
                     target_player_id = message.get("target_player_id")
                     if not target_player_id:
                         await manager.send_personal_message({
@@ -174,37 +205,41 @@ async def websocket_table_endpoint(
                         }, websocket)
                         continue
 
-                    result = await GameActionHandler.handle_challenge_uno(table_id, player, target_player_id, db=db)
+                    print(f"GAME ACTION: {player.username} challenging UNO")
+                    
+                    result = await GameActionHandler.handle_challenge_uno(
+                        table_id, player, target_player_id, db=db
+                    )
+                    
                     await manager.send_personal_message({
                         "type": "challenge_uno_result",
                         "data": result
                     }, websocket)
 
+                else:
+                    print(f"WEBSOCKET: Unknown message type: {message_type}")
+
             except WebSocketDisconnect:
+                print(f"WEBSOCKET: {player.username} disconnected normally")
                 break
+            except json.JSONDecodeError as e:
+                print(f"WEBSOCKET: JSON decode error from {player.username}: {e}")
+                continue
             except Exception as e:
-                print(f"Error processing message: {e}")
+                print(f"WEBSOCKET: Error processing message from {player.username}: {e}")
                 continue
 
     except WebSocketDisconnect:
-        print(f"Client disconnected from table {table_id}")
+        print(f"WEBSOCKET: {player.username} connection lost")
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        print(f"WEBSOCKET: Unexpected error with {player.username}: {e}")
     finally:
+        print(f"WEBSOCKET: Cleaning up connection for {player.username}")
         await manager.disconnect(websocket, db_session_manager)
-        if player:  # Make sure player is defined
-            await manager.broadcast_to_table({
-                "type": "player_left",
-                "data": {
-                    "player_id": str(player.id),
-                    "username": player.username
-                }
-            }, table_id)
 
 @app.get("/")
 async def root():
     return {"message": "Uno Game Server is running"}
-
 
 @app.get("/tables", response_model=list)
 async def list_tables(db: AsyncSession = Depends(get_db)):
@@ -218,7 +253,6 @@ async def list_tables(db: AsyncSession = Depends(get_db)):
         "max_players": table.max_players,
         "status": table.status.value
     } for table in tables]
-
 
 @app.post("/tables/{table_id}/join", response_model=dict)
 async def join_table(table_id: str, username: str, db: AsyncSession = Depends(get_db)):
@@ -269,7 +303,6 @@ async def get_table(table_id: str, db: AsyncSession = Depends(get_db)):
         "game_state": game_state_to_public_dict(game_state, table)
     }
 
-
 @app.post("/tables", response_model=dict)
 async def create_table(name: str, max_players: int = 10, db: AsyncSession = Depends(get_db)):
     table_repo = TableRepository(db)
@@ -280,6 +313,7 @@ async def create_table(name: str, max_players: int = 10, db: AsyncSession = Depe
         "table_name": table.name,
         "max_players": table.max_players
     }
+
 @app.post("/tables/{table_id}/leave")
 async def leave_table(table_id: str, session_token: str, db: AsyncSession = Depends(get_db)):
     session_repo = SessionRepository(db)
@@ -306,7 +340,6 @@ async def leave_table(table_id: str, session_token: str, db: AsyncSession = Depe
 
     return {"message": "Left table successfully"}
 
-
 @app.post("/tables/{table_id}/start")
 async def start_game(table_id: str, session_token: str = Query(...), db: AsyncSession = Depends(get_db)):
     session_repo = SessionRepository(db)
@@ -326,12 +359,16 @@ async def start_game(table_id: str, session_token: str = Query(...), db: AsyncSe
     if len(table.players) < 2:
         raise HTTPException(status_code=400, detail="Need at least 2 players to start")
 
+    print(f"Starting game for table {table_id} by player {player.username}")
+    
     result = await GameActionHandler.handle_start_game(table_id, player, db=db)
+    
+    print(f"Game start result: {result}")
+    
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["error"])
 
     return result
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
