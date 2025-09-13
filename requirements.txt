@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+websockets
+pydantic
+redis
+python-multipart
+python-dotenv
+sqlalchemy
+asyncpg

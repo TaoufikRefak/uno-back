@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:15
+    container_name: uno_db_container
+    restart: always
+    environment:
+      POSTGRES_USER: uno_user
+      POSTGRES_PASSWORD: uno_password
+      POSTGRES_DB: uno_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
