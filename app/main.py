@@ -368,13 +368,17 @@ async def join_table(
     # 1. DETERMINE USER IDENTITY (Authenticated or Guest)
     # ===================================================================
     user_id = None
-    if current_user:
+    is_guest = current_user is None # <--- Determine if user is a guest here
+
+    if not is_guest:
+        # Authenticated user
         username = current_user.username
         user_id = current_user.id
     elif not username:
+        # Guest user without a username provided
         raise HTTPException(status_code=400, detail="Username is required for guest users")
     else:
-        # For guest users, find or create a corresponding UserModel
+        # Guest user with a username, find or create their UserModel
         user_repo = UserRepository(db)
         existing_user = await user_repo.get_user_by_username(username)
         if existing_user:
@@ -383,7 +387,7 @@ async def join_table(
             guest_user = UserModel(
                 id=uuid.uuid4(),
                 username=username,
-                email=f"{username.lower().replace(' ', '_')}@guest.uno", # More robust placeholder
+                email=f"{username.lower().replace(' ', '_')}@guest.uno",
                 created_at=int(time.time())
             )
             db.add(guest_user)
@@ -406,18 +410,14 @@ async def join_table(
     # 3. HANDLE PLAYER LOGIC (Re-join or New Join)
     # ===================================================================
     
-    # Check if a player linked to this user_id is already in the table
     existing_player = next((p for p in table.players + table.spectators if p.user_id == user_id), None)
 
-    player_to_process = None
     response_data = {}
 
     if existing_player:
         # --- SCENARIO A: PLAYER IS RE-JOINING ---
         print(f"Player '{existing_player.username}' is re-joining table '{table.name}'.")
-        player_to_process = existing_player
         
-        # Issue a new session token for the existing player
         session_token = await session_repo.create_session(existing_player, table_id)
         
         response_data = {
@@ -432,12 +432,19 @@ async def join_table(
         print(f"New player '{username}' is joining table '{table.name}'.")
         game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
 
-        # Determine the player's role
-        role = PlayerRole.PLAYER
-        if game_state and game_state.status == GameStatus.IN_PROGRESS:
+        # --- MODIFIED ROLE ASSIGNMENT LOGIC ---
+        role = PlayerRole.PLAYER # Default to player for authenticated users
+        
+        if is_guest:
+            # ***************************************************************
+            # ** RULE: Unauthenticated (guest) users can ONLY be spectators **
+            # ***************************************************************
+            role = PlayerRole.SPECTATOR
+        elif game_state and game_state.status == GameStatus.IN_PROGRESS:
+            # RULE: Any authenticated user joining a game in progress is a spectator
             role = PlayerRole.SPECTATOR
         elif len(table.players) >= table.max_players:
-            # If game hasn't started but is full, they can only spectate
+            # RULE: Any authenticated user joining a full (but not started) game is a spectator
             role = PlayerRole.SPECTATOR
         
         # Create a new Player object
@@ -448,23 +455,19 @@ async def join_table(
             is_online=True,
             role=role
         )
-        player_to_process = new_player
 
         # Persist the new player to the database
         player_repo = PlayerRepository(db)
         await player_repo.create_player(new_player, uuid.UUID(table_id), user_id)
         
-        # Add the player to the local table object to prepare for update
+        # Add the player to the local table object
         if role == PlayerRole.SPECTATOR:
             table.spectators.append(new_player)
         else:
             table.players.append(new_player)
         
-        # Update the table in the database (this step is not strictly necessary here
-        # as we fetch a fresh copy later, but it's good practice)
         await table_repo.update_table(table)
         
-        # Issue a session token for the new player
         session_token = await session_repo.create_session(new_player, table_id)
         
         response_data = {
@@ -479,11 +482,9 @@ async def join_table(
     # 4. UNIFIED BROADCAST AND RESPONSE
     # ===================================================================
     
-    # Fetch the latest state from the database, which now includes the new player/spectator
     fresh_table = await table_repo.get_table(uuid.UUID(table_id))
     fresh_game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
     
-    # Broadcast the updated state to ALL clients connected to this table
     if fresh_game_state:
         print(f"Broadcasting updated game state to table {table_id}.")
         await manager.broadcast_to_table({
@@ -491,8 +492,9 @@ async def join_table(
             "data": fresh_game_state.to_public_dict(fresh_table)
         }, table_id)
 
-    # Return the session details to the specific user who just joined
     return response_data
+
+
 @app.post("/tables", response_model=dict)
 async def create_table(
     name: str, 
