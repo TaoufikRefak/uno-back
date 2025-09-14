@@ -8,3 +8,8 @@ python-dotenv
 sqlalchemy
 asyncpg
 fastapi[standard]
+authlib
+python-jose[cryptography] 
+passlib[bcrypt] 
+requests
+itsdangerous

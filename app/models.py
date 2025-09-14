@@ -1,35 +1,27 @@
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional, List, Dict, Any
+import uuid
 from pydantic import BaseModel, Field
 import random
 from uuid import UUID, uuid4
 from typing import Set
 import time
 from pydantic import ConfigDict
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+
+from app.schemas import CardColor, CardType, OAuthProvider, PlayerRole,GameDirection, GameStatus, PlayerRole, UnoDeclarationState
 
 
-class UnoDeclarationState(str, Enum):
-    NOT_REQUIRED = "not_required"
-    PENDING = "pending"
-    DECLARED = "declared"
-    PENALIZED = "penalized"
+SECRET_KEY = "your-secret-key-here"  # Change this in production
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-
-class CardColor(str, Enum):
-    RED = "red"
-    YELLOW = "yellow"
-    GREEN = "green"
-    BLUE = "blue"
-    WILD = "wild"
-
-class CardType(str, Enum):
-    NUMBER = "number"
-    SKIP = "skip"
-    REVERSE = "reverse"
-    DRAW_TWO = "draw_two"
-    WILD = "wild"
-    WILD_DRAW_FOUR = "wild_draw_four"
 
 class Card(BaseModel):
     color: CardColor
@@ -129,10 +121,55 @@ class CardDeck:
     
 
 
+# Pydantic models
+class UserBase(BaseModel):
+    email: str
+    username: str
+    is_active: Optional[bool] = True
 
-class PlayerRole(str, Enum):
-    PLAYER = "player"
-    SPECTATOR = "spectator"
+class UserCreate(UserBase):
+    password: Optional[str] = None  # For local registration
+
+class User(UserBase):
+    id: UUID
+    created_at: float
+    
+    class Config:
+        from_attributes = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    expires_in: int
+    refresh_token: Optional[str] = None
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+
+class OAuthToken(BaseModel):
+    provider: OAuthProvider
+    token: str
+
+# Utility functions
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def create_refresh_token():
+    return str(uuid.uuid4())
+
 
 class Player(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -175,14 +212,7 @@ class Player(BaseModel):
 
 
 
-class GameDirection(str, Enum):
-    CLOCKWISE = "clockwise"
-    COUNTER_CLOCKWISE = "counter_clockwise"
 
-class GameStatus(str, Enum):
-    WAITING = "waiting"  # Waiting for players to join
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
 
 class Table(BaseModel):
     id: UUID = Field(default_factory=uuid4)

@@ -2,9 +2,14 @@ import uuid
 from app.repositories.session_repository import SessionRepository
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+import os
 from app.websocket.connection_manager import manager
 from app.session_manager import DBSessionManager
-from app.models import GameStatus, PlayerRole, Table, Player, GameState, CardDeck, CardColor
+
+# Import from the new schemas file
+from app.schemas import CardColor, GameStatus, OAuthProvider, PlayerRole
+from app.models import Player, Token, TokenData, User, UserCreate, OAuthToken, create_refresh_token
 from app.database.database import get_db
 from app.repositories.table_repository import TableRepository
 from app.repositories.player_repository import PlayerRepository
@@ -15,9 +20,11 @@ import json
 import time
 from app.game_logic.game_actions import GameActionHandler
 from app.utils.serialization import game_state_to_public_dict, card_to_dict
+from app.auth import get_current_active_user, router as auth_router
 
 
 app = FastAPI(title="Uno Game API", version="1.0.0")
+app.include_router(auth_router)
 
 @app.on_event("startup")
 async def on_startup():
@@ -32,7 +39,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SECRET_KEY", "super-secret"),  # must be set in .env
+)
 # Update the WebSocket test endpoint to handle CORS
 @app.websocket("/ws/test")
 async def websocket_test_endpoint(websocket: WebSocket):
@@ -328,7 +338,9 @@ async def list_tables(db: AsyncSession = Depends(get_db)):
     } for table in tables]
 
 @app.post("/tables/{table_id}/join", response_model=dict)
-async def join_table(table_id: str, username: str, db: AsyncSession = Depends(get_db)):
+async def join_table(table_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    username = current_user.username
+
     table_repo = TableRepository(db)
     table = await table_repo.get_table(uuid.UUID(table_id))
     
@@ -382,7 +394,7 @@ async def join_table(table_id: str, username: str, db: AsyncSession = Depends(ge
 
 
 @app.post("/tables", response_model=dict)
-async def create_table(name: str, max_players: int = 10, db: AsyncSession = Depends(get_db)):
+async def create_table(name: str, max_players: int = 10, db: AsyncSession = Depends(get_db),current_user: User = Depends(get_current_active_user)):
     table_repo = TableRepository(db)
     table = await table_repo.create_table(name, max_players)
     
