@@ -1,3 +1,4 @@
+from typing import Optional
 import uuid
 from app.repositories.session_repository import SessionRepository
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Depends
@@ -14,13 +15,15 @@ from app.database.database import get_db
 from app.repositories.table_repository import TableRepository
 from app.repositories.player_repository import PlayerRepository
 from app.repositories.game_state_repository import GameStateRepository
+from app.repositories.user_repository import UserRepository
+from app.database.models import UserModel, PlayerModel, TableModel
 from sqlalchemy.ext.asyncio import AsyncSession
 import uvicorn
 import json
 import time
 from app.game_logic.game_actions import GameActionHandler
 from app.utils.serialization import game_state_to_public_dict, card_to_dict
-from app.auth import get_current_active_user, router as auth_router
+from app.auth import get_current_active_user, get_current_user_optional, router as auth_router
 
 
 app = FastAPI(title="Uno Game API", version="1.0.0")
@@ -338,9 +341,39 @@ async def list_tables(db: AsyncSession = Depends(get_db)):
     } for table in tables]
 
 @app.post("/tables/{table_id}/join", response_model=dict)
-async def join_table(table_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
-    username = current_user.username
-
+async def join_table(
+    table_id: str, 
+    username: str = Query(None),
+    db: AsyncSession = Depends(get_db), 
+    current_user: User = Depends(get_current_user_optional)
+):
+    # If user is authenticated, use their username
+    if current_user:
+        username = current_user.username
+        user_id = current_user.id
+    elif not username:
+        raise HTTPException(status_code=400, detail="Username is required for guest users")
+    else:
+        # For guest users, we need to create a user first
+        user_repo = UserRepository(db)
+        
+        # Check if a guest user with this username already exists
+        existing_user = await user_repo.get_user_by_username(username)
+        if existing_user:
+            user_id = existing_user.id
+        else:
+            # Create a new guest user
+            guest_user = UserModel(
+                id=uuid.uuid4(),
+                username=username,
+                email=f"{username}@guest.com",  # Placeholder email
+                created_at=int(time.time())
+            )
+            db.add(guest_user)
+            await db.commit()
+            await db.refresh(guest_user)
+            user_id = guest_user.id
+    
     table_repo = TableRepository(db)
     table = await table_repo.get_table(uuid.UUID(table_id))
     
@@ -351,27 +384,44 @@ async def join_table(table_id: str, db: AsyncSession = Depends(get_db), current_
     game_state_repo = GameStateRepository(db)
     game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
     
+    # Check if user is already in the table
+    for player in table.players + table.spectators:
+        if hasattr(player, 'user_id') and player.user_id == user_id:
+            # User already in table
+            return {
+                "player_id": str(player.id),
+                "session_token": None,  # Already in table
+                "table_id": table_id,
+                "role": player.role.value
+            }
+    
     # Create a new player
-    player = Player(username=username)
+    player_id = uuid.uuid4()
+    player = Player(
+        id=player_id,
+        username=username,
+        hand=[],
+        is_online=True
+    )
     
     role = PlayerRole.PLAYER
     if game_state and game_state.status == GameStatus.IN_PROGRESS:
         # Join as spectator if game is in progress
         role = PlayerRole.SPECTATOR
-        # Spectators don't get cards
         player.hand = []
     else:
         # Join as player if game hasn't started
         if len(table.players) >= table.max_players:
             raise HTTPException(status_code=400, detail="Table is full")
-        # Regular players get an empty hand (will be dealt cards when game starts)
         player.hand = []
     
     player.role = role
     
     # Update database
     player_repo = PlayerRepository(db)
-    await player_repo.create_player(player, uuid.UUID(table_id))
+    
+    # Create the player in database with the user_id
+    await player_repo.create_player(player, uuid.UUID(table_id), user_id)
     
     # Add to appropriate list based on role
     if role == PlayerRole.SPECTATOR:
@@ -381,9 +431,11 @@ async def join_table(table_id: str, db: AsyncSession = Depends(get_db), current_
     
     await table_repo.update_table(table)
     
-    # Create a session for the player
-    session_repo = SessionRepository(db)
-    session_token = await session_repo.create_session(player, table_id)
+    # Create a session for the player (only for guest users)
+    session_token = None
+    if not current_user:
+        session_repo = SessionRepository(db)
+        session_token = await session_repo.create_session(player, table_id)
     
     return {
         "player_id": str(player.id),
@@ -394,14 +446,25 @@ async def join_table(table_id: str, db: AsyncSession = Depends(get_db), current_
 
 
 @app.post("/tables", response_model=dict)
-async def create_table(name: str, max_players: int = 10, db: AsyncSession = Depends(get_db),current_user: User = Depends(get_current_active_user)):
+async def create_table(
+    name: str, 
+    max_players: int = 10, 
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_optional)
+):
     table_repo = TableRepository(db)
     table = await table_repo.create_table(name, max_players)
+    
+    # If user is authenticated, mark them as the creator
+    creator_id = current_user.id if current_user else None
+    creator_name = current_user.username if current_user else "guest"
     
     return {
         "table_id": str(table.id),
         "table_name": table.name,
-        "max_players": table.max_players
+        "max_players": table.max_players,
+        "creator_id": str(creator_id) if creator_id else None,
+        "creator_name": creator_name
     }
 
 @app.post("/tables/{table_id}/leave")

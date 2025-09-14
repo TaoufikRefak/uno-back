@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
-from app.database.models import TableModel, PlayerModel, GameStateModel
+from app.database.models import TableModel, PlayerModel, GameStateModel, UserModel
 from app.models import PlayerRole, Table, Player, GameState, Card
 from typing import List, Optional
 import uuid
@@ -54,27 +54,34 @@ class TableRepository:
         players = []
         spectators = []
         for player_model in player_models:
-            hand = [Card(**card) for card in player_model.hand]
-            player = Player(
-                id=player_model.id,
-                username=player_model.username,
-                hand=hand,
-                is_online=player_model.is_online,
-                uno_declaration=player_model.uno_declaration,
-                role=player_model.role  # Make sure to include role
+            # Get the user associated with this player
+            result = await self.db.execute(
+                select(UserModel).where(UserModel.id == player_model.user_id)
             )
+            user_model = result.scalar_one_or_none()
             
-            # Separate players and spectators based on role
-            if player_model.role == PlayerRole.SPECTATOR:
-                spectators.append(player)
-            else:
-                players.append(player)
+            if user_model:
+                hand = [Card(**card) for card in player_model.hand]
+                player = Player(
+                    id=player_model.id,
+                    username=user_model.username,  # Get username from UserModel
+                    hand=hand,
+                    is_online=player_model.is_online,
+                    uno_declaration=player_model.uno_declaration,
+                    role=player_model.role
+                )
+                
+                # Separate players and spectators based on role
+                if player_model.role == PlayerRole.SPECTATOR:
+                    spectators.append(player)
+                else:
+                    players.append(player)
         
         return Table(
             id=table_model.id,
             name=table_model.name,
             players=players,
-            spectators=spectators,  # Include spectators
+            spectators=spectators,
             max_players=table_model.max_players,
             status=table_model.status,
             created_at=table_model.created_at
@@ -124,16 +131,25 @@ class TableRepository:
             )
             player_models = result.scalars().all()
 
-            players = [
-                Player(
-                    id=player.id,
-                    username=player.username,
-                    hand=[Card(**card) for card in player.hand],
-                    is_online=player.is_online,
-                    uno_declaration=player.uno_declaration,
+            players = []
+            for player_model in player_models:
+                # Get the user associated with this player
+                result = await self.db.execute(
+                    select(UserModel).where(UserModel.id == player_model.user_id)
                 )
-                for player in player_models
-            ]
+                user_model = result.scalar_one_or_none()
+                
+                if user_model:
+                    hand = [Card(**card) for card in player_model.hand]
+                    player = Player(
+                        id=player_model.id,
+                        username=user_model.username,  # Get username from UserModel
+                        hand=hand,
+                        is_online=player_model.is_online,
+                        uno_declaration=player_model.uno_declaration,
+                        role=player_model.role
+                    )
+                    players.append(player)
 
             tables.append(
                 Table(

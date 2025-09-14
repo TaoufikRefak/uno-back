@@ -16,7 +16,7 @@ from app.schemas import CardColor, CardType, OAuthProvider, PlayerRole,GameDirec
 
 SECRET_KEY = "your-secret-key-here"  # Change this in production
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 24 * 60  # 24 hours
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

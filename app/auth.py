@@ -20,6 +20,7 @@ from app.models import Token, TokenData, User, UserCreate, OAuthToken, create_re
 import os
 from fastapi import HTTPException
 from authlib.integrations.starlette_client import OAuth
+from fastapi.responses import RedirectResponse
 
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
@@ -50,23 +51,37 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
+        # First, try to decode the JWT
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
         token_data = TokenData(username=username)
-    except JWTError:
+    except JWTError as e:
+        print(f"JWT Error: {e}")
         raise credentials_exception
         
     # Check if token is still valid in database
     result = await db.execute(
         select(UserSessionModel).where(
             UserSessionModel.access_token == token,
-            UserSessionModel.expires_at > time()
+            UserSessionModel.expires_at > int(time())
         )
     )
     session = result.scalar_one_or_none()
     if not session:
+        print(f"Session not found for token: {token}")
+        # Let's check if the token exists at all, regardless of expiration
+        result = await db.execute(
+            select(UserSessionModel).where(
+                UserSessionModel.access_token == token
+            )
+        )
+        session = result.scalar_one_or_none()
+        if session:
+            print(f"Token found but expired. Expires at: {session.expires_at}, Current time: {int(time())}")
+        else:
+            print("Token not found in database at all")
         raise credentials_exception
         
     # Get user from database
@@ -75,6 +90,7 @@ async def get_current_user(
     )
     user = result.scalar_one_or_none()
     if user is None:
+        print(f"User not found for username: {token_data.username}")
         raise credentials_exception
     return user
 
@@ -110,11 +126,13 @@ async def generate_unique_username(db: AsyncSession, base_username: str):
 
 # Add Google OAuth routes
 @router.get("/google/login")
-async def google_login(request: Request):
+async def google_login(request: Request, redirect_url: str = "http://localhost:3000"):
     redirect_uri = request.url_for('google_callback')
+    # Store the redirect URL in session
+    request.session['oauth_redirect'] = redirect_url
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
-@router.get("/google/callback", response_model=Token)
+@router.get("/google/callback")
 async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
     try:
         token = await oauth.google.authorize_access_token(request)
@@ -167,11 +185,24 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
         db.add(session)
         await db.commit()
         
-        return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
-        }
+        # Redirect to frontend with token
+        redirect_url = "http://localhost:3000"  # Your frontend URL
+        return RedirectResponse(
+            url=f"{redirect_url}?access_token={access_token}&token_type=bearer&expires_in={ACCESS_TOKEN_EXPIRE_MINUTES * 60}"
+        )
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    
+
+async def get_current_user_optional(
+    db: AsyncSession = Depends(get_db),
+    token: Optional[str] = Depends(oauth2_scheme)
+):
+    if token is None:
+        return None
+        
+    try:
+        return await get_current_user(token, db)
+    except:
+        return None
