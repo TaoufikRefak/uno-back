@@ -356,134 +356,143 @@ async def list_tables(db: AsyncSession = Depends(get_db)):
         "status": table.status.value
     } for table in tables]
 
+
 @app.post("/tables/{table_id}/join", response_model=dict)
 async def join_table(
-    table_id: str, 
+    table_id: str,
     username: str = Query(None),
-    db: AsyncSession = Depends(get_db), 
+    db: AsyncSession = Depends(get_db),
     current_user: Optional[UserModel] = Depends(try_get_current_user)
 ):
-    # If user is authenticated, use their username
+    # ===================================================================
+    # 1. DETERMINE USER IDENTITY (Authenticated or Guest)
+    # ===================================================================
+    user_id = None
     if current_user:
         username = current_user.username
         user_id = current_user.id
     elif not username:
         raise HTTPException(status_code=400, detail="Username is required for guest users")
     else:
-        # For guest users, we need to create a user first
+        # For guest users, find or create a corresponding UserModel
         user_repo = UserRepository(db)
-        
-        # Check if a guest user with this username already exists
         existing_user = await user_repo.get_user_by_username(username)
         if existing_user:
             user_id = existing_user.id
         else:
-            # Create a new guest user
             guest_user = UserModel(
                 id=uuid.uuid4(),
                 username=username,
-                email=f"{username}@guest.com",  # Placeholder email
+                email=f"{username.lower().replace(' ', '_')}@guest.uno", # More robust placeholder
                 created_at=int(time.time())
             )
             db.add(guest_user)
             await db.commit()
             await db.refresh(guest_user)
             user_id = guest_user.id
-    
+
+    # ===================================================================
+    # 2. LOAD REPOSITORIES AND TABLE DATA
+    # ===================================================================
     table_repo = TableRepository(db)
     table = await table_repo.get_table(uuid.UUID(table_id))
-    
     if not table:
         raise HTTPException(status_code=404, detail="Table not found")
+
+    session_repo = SessionRepository(db)
+    game_state_repo = GameStateRepository(db)
+
+    # ===================================================================
+    # 3. HANDLE PLAYER LOGIC (Re-join or New Join)
+    # ===================================================================
     
+    # Check if a player linked to this user_id is already in the table
+    existing_player = next((p for p in table.players + table.spectators if p.user_id == user_id), None)
 
-    session_repo = SessionRepository(db) 
-
-    existing_player = None
-    for p in table.players + table.spectators:
-        if hasattr(p, 'user_id') and p.user_id == user_id:
-            existing_player = p
-            break
+    player_to_process = None
+    response_data = {}
 
     if existing_player:
-        # User already in table. Re-issue a session token for them.
-        print(f"Player {existing_player.username} is re-joining table {table_id}.")
+        # --- SCENARIO A: PLAYER IS RE-JOINING ---
+        print(f"Player '{existing_player.username}' is re-joining table '{table.name}'.")
+        player_to_process = existing_player
         
-        # Create a new session for the existing player instance
+        # Issue a new session token for the existing player
         session_token = await session_repo.create_session(existing_player, table_id)
         
-        return {
+        response_data = {
             "player_id": str(existing_player.id),
             "user_id": str(user_id),
-            "session_token": session_token, # <-- Return the NEW token
+            "session_token": session_token,
             "table_id": table_id,
             "role": existing_player.role.value
         }
-    # Check if game is already in progress
-    game_state_repo = GameStateRepository(db)
-    game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
-    
-    # Check if user is already in the table
-    for player in table.players + table.spectators:
-        if hasattr(player, 'user_id') and player.user_id == user_id:
-            # User already in table
-            return {
-                "player_id": str(player.id),
-                "session_token": None,  # Already in table
-                "table_id": table_id,
-                "role": player.role.value
-            }
-    
-    # Create a new player
-    player_id = uuid.uuid4()
-    player = Player(
-        id=player_id,
-        username=username,
-        hand=[],
-        is_online=True
-    )
-    
-    is_guest = current_user is None
-    role = PlayerRole.PLAYER  # Default role
-    if game_state and game_state.status == GameStatus.IN_PROGRESS:
-        # Join as spectator if game is in progress
-        role = PlayerRole.SPECTATOR
-        player.hand = []
     else:
-        # Join as player if game hasn't started
-        if len(table.players) >= table.max_players:
-            raise HTTPException(status_code=400, detail="Table is full")
+        # --- SCENARIO B: PLAYER IS JOINING FOR THE FIRST TIME ---
+        print(f"New player '{username}' is joining table '{table.name}'.")
+        game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
+
+        # Determine the player's role
         role = PlayerRole.PLAYER
-        player.hand = []
-    
-    player.role = role
-    
-    # Update database
-    player_repo = PlayerRepository(db)
-    
-    # Create the player in database with the user_id
-    await player_repo.create_player(player, uuid.UUID(table_id), user_id)
-    
-    # Add to appropriate list based on role
-    if role == PlayerRole.SPECTATOR:
-        table.spectators.append(player)
-    else:
-        table.players.append(player)
-    
-    await table_repo.update_table(table)
-    
-    # Create a session for the player (only for guest users)
-    session_token = await session_repo.create_session(player, table_id)
-    
-    return {
-        "player_id": str(player.id),
-        "user_id": str(user_id), # <-- ADD THIS
-        "session_token": session_token,
-        "table_id": table_id,
-        "role": role.value
-    }
+        if game_state and game_state.status == GameStatus.IN_PROGRESS:
+            role = PlayerRole.SPECTATOR
+        elif len(table.players) >= table.max_players:
+            # If game hasn't started but is full, they can only spectate
+            role = PlayerRole.SPECTATOR
+        
+        # Create a new Player object
+        new_player = Player(
+            id=uuid.uuid4(),
+            username=username,
+            hand=[],
+            is_online=True,
+            role=role
+        )
+        player_to_process = new_player
 
+        # Persist the new player to the database
+        player_repo = PlayerRepository(db)
+        await player_repo.create_player(new_player, uuid.UUID(table_id), user_id)
+        
+        # Add the player to the local table object to prepare for update
+        if role == PlayerRole.SPECTATOR:
+            table.spectators.append(new_player)
+        else:
+            table.players.append(new_player)
+        
+        # Update the table in the database (this step is not strictly necessary here
+        # as we fetch a fresh copy later, but it's good practice)
+        await table_repo.update_table(table)
+        
+        # Issue a session token for the new player
+        session_token = await session_repo.create_session(new_player, table_id)
+        
+        response_data = {
+            "player_id": str(new_player.id),
+            "user_id": str(user_id),
+            "session_token": session_token,
+            "table_id": table_id,
+            "role": role.value
+        }
 
+    # ===================================================================
+    # 4. UNIFIED BROADCAST AND RESPONSE
+    # ===================================================================
+    
+    # Fetch the latest state from the database, which now includes the new player/spectator
+    fresh_table = await table_repo.get_table(uuid.UUID(table_id))
+    fresh_game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
+    
+    # Broadcast the updated state to ALL clients connected to this table
+    if fresh_game_state:
+        print(f"Broadcasting updated game state to table {table_id}.")
+        await manager.broadcast_to_table({
+            "type": "game_state",
+            "data": fresh_game_state.to_public_dict(fresh_table)
+        }, table_id)
+
+    # Return the session details to the specific user who just joined
+    return response_data
 @app.post("/tables", response_model=dict)
 async def create_table(
     name: str, 

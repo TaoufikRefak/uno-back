@@ -38,7 +38,7 @@ class GameActionHandler:
         
         table_repo = TableRepository(db)
         game_state_repo = GameStateRepository(db)
-        player_repo = PlayerRepository(db)
+        # player_repo = PlayerRepository(db)
         
         table = await table_repo.get_table(uuid.UUID(table_id))
         game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
@@ -103,7 +103,7 @@ class GameActionHandler:
         
         # ========== KEY FIX: Handle special card effects properly ==========
         action_result = await GameActionHandler._handle_special_card(
-            table, game_state, played_card, chosen_color
+            table, game_state, played_card, db # <-- Pass `db` to the helper function
         )
 
         # Check if player has won
@@ -150,20 +150,34 @@ class GameActionHandler:
         # Update database - table first, then game state
         await table_repo.update_table(table)
         await game_state_repo.update_game_state(game_state)
+        fresh_table = await table_repo.get_table(uuid.UUID(table_id))
 
         # Send the player's updated hand personally
         session_mgr = DBSessionManager(db)
-        await manager.send_to_player({
-            "type": "your_hand",
-            "data": [card.to_dict() for card in player.hand]
-        }, str(player.id), session_mgr)  # Add session_mgr here
 
-        # Broadcast the updated game state
+        updated_player_obj = next((p for p in fresh_table.players if p.id == player.id), None)
+
+        if updated_player_obj:
+            await manager.send_to_player({
+                "type": "your_hand",
+                "data": [card.to_dict() for card in updated_player_obj.hand]
+            }, str(player.id), session_mgr)
+        
+        # Also send updated hand to any player who was forced to draw
+        if action_result.get("drawn_player_id"):
+            drawn_player_obj = next((p for p in fresh_table.players if str(p.id) == action_result["drawn_player_id"]), None)
+            if drawn_player_obj:
+                 await manager.send_to_player({
+                    "type": "your_hand",
+                    "data": [card.to_dict() for card in drawn_player_obj.hand]
+                }, str(drawn_player_obj.id), session_mgr)
+
+        # 4. Broadcast the FRESH and ACCURATE game state to everyone
         await manager.broadcast_to_table({
             "type": "game_state",
-            "data": game_state.to_public_dict(table)
+            "data": game_state.to_public_dict(fresh_table) # Use fresh_table here
         }, str(table.id))
-
+        
         return {"success": True, **action_result}
 
     @staticmethod
@@ -209,45 +223,30 @@ class GameActionHandler:
                 result["message"] = "Game direction reversed!"
                 result["turn_already_advanced"] = False
 
-        elif card.type == CardType.DRAW_TWO:
-            # Next player draws 2 cards and loses their turn
+        elif card.type in (CardType.DRAW_TWO, CardType.WILD_DRAW_FOUR):
+            draw_count = 2 if card.type == CardType.DRAW_TWO else 4
+            
+            # Next player draws cards and loses their turn
             next_player_idx = game_state.get_next_player_index(table)
             next_player = table.players[next_player_idx]
-            drawn_cards = game_state.draw_cards_for_player(next_player, 2)
+            drawn_cards = game_state.draw_cards_for_player(next_player, draw_count)
             
-            # Skip the next player's turn (they drew cards, so they lose turn)
-            game_state.next_turn(table)  # Move to next player (who drew cards)
-            game_state.next_turn(table)  # Move to the player after them
+            # Skip the next player's turn
+            game_state.next_turn(table)
+            game_state.next_turn(table)
             
             result["next_player_drew"] = len(drawn_cards)
-            result["message"] = f"Next player drew 2 cards and lost their turn!"
+            result["message"] = f"Next player drew {draw_count} cards and lost their turn!"
             result["turn_already_advanced"] = True
-            
+            result["drawn_player_id"] = str(next_player.id) # <-- IMPORTANT: Return who drew
+
+            if card.type == CardType.WILD_DRAW_FOUR:
+                 # The played card's color is set in the calling function, no need for chosen_color here
+                 pass
+
             # Broadcast the turn change here since we handled it
             new_current_player = game_state.get_current_player(table)
             await broadcast_turn_changed(str(table.id), str(new_current_player.id), new_current_player.username)
-
-        elif card.type == CardType.WILD_DRAW_FOUR:
-            # Next player draws 4 cards and loses their turn
-            next_player_idx = game_state.get_next_player_index(table)
-            next_player = table.players[next_player_idx]
-            drawn_cards = game_state.draw_cards_for_player(next_player, 4)
-            
-            # Skip the next player's turn (they drew cards, so they lose turn)
-            game_state.next_turn(table)  # Move to next player (who drew cards)
-            game_state.next_turn(table)  # Move to the player after them
-            
-            result["next_player_drew"] = len(drawn_cards)
-            result["message"] = f"Next player drew 4 cards and lost their turn!"
-            result["chosen_color"] = chosen_color.value if chosen_color else "unknown"
-            result["turn_already_advanced"] = True
-            
-            # Broadcast the turn change here since we handled it
-            new_current_player = game_state.get_current_player(table)
-            await broadcast_turn_changed(str(table.id), str(new_current_player.id), new_current_player.username)
-
-        # For regular number cards and wild cards (no special effect), 
-        # turn_already_advanced remains False so normal turn advance happens
 
         return result
     
