@@ -173,6 +173,8 @@ def create_refresh_token():
 
 class Player(BaseModel):
     id: UUID = Field(default_factory=uuid4)
+    user_id: Optional[UUID] = None # <-- ADD THIS LINE to link player to user
+
     username: str
     hand: List[Card] = Field(default_factory=list)
     session_token: Optional[str] = None
@@ -222,7 +224,8 @@ class Table(BaseModel):
     max_players: int = Field(default=10, ge=2, le=10)
     status: GameStatus = GameStatus.WAITING
     created_at: float = Field(default_factory=lambda: time.time())
-    
+    creator_id: Optional[UUID] = None # <-- ADD THIS LINE
+
     def add_player(self, player: Player) -> bool:
         """Add a player to the table if there's space"""
         if len(self.players) < self.max_players and self.status == GameStatus.WAITING:

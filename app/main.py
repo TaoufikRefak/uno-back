@@ -7,6 +7,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import os
 from app.websocket.connection_manager import manager
 from app.session_manager import DBSessionManager
+from sqlalchemy import select, update, delete
 
 # Import from the new schemas file
 from app.schemas import CardColor, GameStatus, OAuthProvider, PlayerRole
@@ -85,10 +86,12 @@ async def websocket_table_endpoint(
         is_spectator = table_player.role == PlayerRole.SPECTATOR
 
     # Connect using the fixed connection manager
-    table_player = table.get_player(str(player.id))
-    if not table_player:
-        await websocket.close(code=1008, reason="Player not in this table")
-        return
+    table_player = None
+    for p in table.players + table.spectators:
+            if str(p.id) == str(player.id):
+                table_player = p
+                break
+                
         
     # Check if player is a spectator
     is_spectator = table_player.role == PlayerRole.SPECTATOR
@@ -217,7 +220,7 @@ async def websocket_table_endpoint(
                     print(f"GAME ACTION: Draw card result: {result.get('success', False)}")
 
                 elif message_type == "start_game":
-
+                    print(f"DEBUG: Received start_game message from {player.username}")
                     if is_spectator:
                         await manager.send_personal_message({
                             "type": "error",
@@ -225,7 +228,18 @@ async def websocket_table_endpoint(
                         }, websocket)
                         continue
                     print(f"GAME ACTION: {player.username} starting game")
+                    result = await db.execute(select(TableModel).where(TableModel.id == uuid.UUID(table_id)))
+                    db_table = result.scalar_one_or_none()
                     
+                    if not db_table or not player.user_id or db_table.creator_id != player.user_id:
+                        await manager.send_personal_message({
+                            "type": "start_game_result",
+                            "data": {
+                                "success": False, 
+                                "error": "Only the table creator can start the game."
+                            }
+                        }, websocket)
+                        continue
                     result = await GameActionHandler.handle_start_game(table_id, player, db=db)
                     
                     await manager.send_personal_message({
@@ -304,8 +318,10 @@ async def get_table(table_id: str, db: AsyncSession = Depends(get_db)):
     table_response = {
         "id": str(table.id),
         "name": table.name,
+        "creator_id": str(table.creator_id) if table.creator_id else None, # <-- ADD THIS
         "players": [{
             "id": str(p.id),
+            "user_id": str(p.user_id) if p.user_id else None, # <-- ADD THIS
             "username": p.username,
             "hand_count": len(p.hand),
             "is_online": p.is_online,
@@ -432,13 +448,12 @@ async def join_table(
     await table_repo.update_table(table)
     
     # Create a session for the player (only for guest users)
-    session_token = None
-    if not current_user:
-        session_repo = SessionRepository(db)
-        session_token = await session_repo.create_session(player, table_id)
+    session_repo = SessionRepository(db)
+    session_token = await session_repo.create_session(player, table_id)
     
     return {
         "player_id": str(player.id),
+        "user_id": str(user_id), # <-- ADD THIS
         "session_token": session_token,
         "table_id": table_id,
         "role": role.value
@@ -452,11 +467,12 @@ async def create_table(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user_optional)
 ):
+    creator_id = current_user.id if current_user else None # Get creator_id
+
     table_repo = TableRepository(db)
-    table = await table_repo.create_table(name, max_players)
+    table = await table_repo.create_table(name, max_players, creator_id)
     
     # If user is authenticated, mark them as the creator
-    creator_id = current_user.id if current_user else None
     creator_name = current_user.username if current_user else "guest"
     
     return {

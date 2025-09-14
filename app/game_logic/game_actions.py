@@ -445,6 +445,8 @@ class GameActionHandler:
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
         """Handle starting a game - DEBUG VERSION"""
+        print(f"DEBUG: handle_start_game called by {player.username}")
+
         print(f"\n=== GAME START DEBUG ===")
         print(f"Table ID: {table_id}")
         print(f"Starting player: {player.username} ({str(player.id)[:8]}...)")

@@ -63,7 +63,8 @@ class TableModel(Base):
     max_players = Column(Integer, default=10)
     status = Column(Enum(GameStatus), default=GameStatus.WAITING)
     created_at = Column(Integer, nullable=False)
-    
+    creator_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True) # <-- ADD THIS
+
     players = relationship("PlayerModel", back_populates="table")
     game_state = relationship("GameStateModel", uselist=False, back_populates="table")
 

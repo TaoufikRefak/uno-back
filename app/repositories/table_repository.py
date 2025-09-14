@@ -10,15 +10,17 @@ class TableRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
     
-    async def create_table(self, name: str, max_players: int = 10) -> Table:
+    async def create_table(self, name: str, max_players: int = 10, creator_id: Optional[uuid.UUID] = None) -> Table:
         table_id = uuid.uuid4()
         table_model = TableModel(
             id=table_id,
             name=name,
             max_players=max_players,
-            created_at=time.time()
+            created_at=time.time(),
+            creator_id=creator_id  # <-- ADD THIS
         )
         self.db.add(table_model)
+        
         
         # Create empty game state
         game_state_model = GameStateModel(table_id=table_id)
@@ -30,10 +32,11 @@ class TableRepository:
             id=table_id,
             name=name,
             players=[],
-            spectators=[],  # Initialize empty spectators list
+            spectators=[],
             max_players=max_players,
             status=table_model.status,
-            created_at=table_model.created_at
+            created_at=table_model.created_at,
+            creator_id=creator_id # <-- ADD THIS
         )
     
     async def get_table(self, table_id: uuid.UUID) -> Optional[Table]:
@@ -64,7 +67,8 @@ class TableRepository:
                 hand = [Card(**card) for card in player_model.hand]
                 player = Player(
                     id=player_model.id,
-                    username=user_model.username,  # Get username from UserModel
+                    user_id=player_model.user_id, # <-- ADD THIS
+                    username=user_model.username,
                     hand=hand,
                     is_online=player_model.is_online,
                     uno_declaration=player_model.uno_declaration,
@@ -84,7 +88,8 @@ class TableRepository:
             spectators=spectators,
             max_players=table_model.max_players,
             status=table_model.status,
-            created_at=table_model.created_at
+            created_at=table_model.created_at,
+            creator_id=table_model.creator_id # <-- ADD THIS
         )
     
     async def update_table(self, table: Table):

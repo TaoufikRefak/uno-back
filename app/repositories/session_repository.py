@@ -55,7 +55,8 @@ class SessionRepository:
         
         return Player(
             id=player_model.id,
-            username=user_model.username,  # Get username from UserModel
+            user_id=player_model.user_id, # <-- ADD THIS
+            username=user_model.username,
             hand=hand,
             is_online=player_model.is_online,
             uno_declaration=player_model.uno_declaration,
