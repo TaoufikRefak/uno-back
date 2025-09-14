@@ -94,6 +94,38 @@ async def get_current_user(
         raise credentials_exception
     return user
 
+
+async def try_get_current_user(
+    request: Request, db: AsyncSession = Depends(get_db)
+) -> Optional[UserModel]:
+    """
+    Tries to get the current user from the token in the request header.
+    If the header/token is missing, invalid, or expired, it returns None
+    instead of raising an exception. This manually handles the header
+    to prevent FastAPI's default 401 behavior for optional auth.
+    """
+    token: Optional[str] = None
+    
+    # Manually get the Authorization header
+    auth_header = request.headers.get("Authorization")
+    
+    # Parse the "Bearer <token>" format
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ")[1]
+
+    if token is None:
+        return None
+        
+    try:
+        # Now we can safely call get_current_user with the extracted token.
+        # Its internal logic will handle JWT decoding and DB session checks.
+        # We wrap this call to catch the HTTPException it raises on failure.
+        return await get_current_user(token, db)
+    except HTTPException:
+        # Any authentication error (expired, invalid, etc.) will be caught.
+        return None
+
+
 async def get_current_active_user(current_user: User = Depends(get_current_user)):
     if not current_user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")

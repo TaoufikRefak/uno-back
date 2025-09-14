@@ -24,7 +24,7 @@ import json
 import time
 from app.game_logic.game_actions import GameActionHandler
 from app.utils.serialization import game_state_to_public_dict, card_to_dict
-from app.auth import get_current_active_user, get_current_user_optional, router as auth_router
+from app.auth import get_current_active_user, get_current_user_optional, router as auth_router, try_get_current_user
 
 
 app = FastAPI(title="Uno Game API", version="1.0.0")
@@ -361,7 +361,7 @@ async def join_table(
     table_id: str, 
     username: str = Query(None),
     db: AsyncSession = Depends(get_db), 
-    current_user: User = Depends(get_current_user_optional)
+    current_user: Optional[UserModel] = Depends(try_get_current_user)
 ):
     # If user is authenticated, use their username
     if current_user:
@@ -396,6 +396,29 @@ async def join_table(
     if not table:
         raise HTTPException(status_code=404, detail="Table not found")
     
+
+    session_repo = SessionRepository(db) 
+
+    existing_player = None
+    for p in table.players + table.spectators:
+        if hasattr(p, 'user_id') and p.user_id == user_id:
+            existing_player = p
+            break
+
+    if existing_player:
+        # User already in table. Re-issue a session token for them.
+        print(f"Player {existing_player.username} is re-joining table {table_id}.")
+        
+        # Create a new session for the existing player instance
+        session_token = await session_repo.create_session(existing_player, table_id)
+        
+        return {
+            "player_id": str(existing_player.id),
+            "user_id": str(user_id),
+            "session_token": session_token, # <-- Return the NEW token
+            "table_id": table_id,
+            "role": existing_player.role.value
+        }
     # Check if game is already in progress
     game_state_repo = GameStateRepository(db)
     game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
@@ -420,7 +443,8 @@ async def join_table(
         is_online=True
     )
     
-    role = PlayerRole.PLAYER
+    is_guest = current_user is None
+    role = PlayerRole.PLAYER  # Default role
     if game_state and game_state.status == GameStatus.IN_PROGRESS:
         # Join as spectator if game is in progress
         role = PlayerRole.SPECTATOR
@@ -429,6 +453,7 @@ async def join_table(
         # Join as player if game hasn't started
         if len(table.players) >= table.max_players:
             raise HTTPException(status_code=400, detail="Table is full")
+        role = PlayerRole.PLAYER
         player.hand = []
     
     player.role = role
@@ -448,7 +473,6 @@ async def join_table(
     await table_repo.update_table(table)
     
     # Create a session for the player (only for guest users)
-    session_repo = SessionRepository(db)
     session_token = await session_repo.create_session(player, table_id)
     
     return {
