@@ -574,5 +574,72 @@ async def start_game(table_id: str, session_token: str = Query(...), db: AsyncSe
 
     return result
 
+
+
+@app.post("/tables/{table_id}/add_bot", response_model=dict)
+async def add_bot_to_table(table_id: str, db: AsyncSession = Depends(get_db)):
+    table_repo = TableRepository(db)
+    table = await table_repo.get_table(uuid.UUID(table_id))
+
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
+    if table.status != GameStatus.WAITING:
+        raise HTTPException(status_code=400, detail="Cannot add a bot to a game in progress.")
+    if len(table.players) >= table.max_players:
+        raise HTTPException(status_code=400, detail="Table is full.")
+
+    # Find a unique name for the bot *for this table*
+    bot_names = ["Bot Alpha", "Bot Bravo", "Bot Charlie", "Bot Delta", "Bot Echo"]
+    
+    # Get the usernames of players already in the current table
+    existing_player_names = {p.username for p in table.players}
+    
+    bot_name = next((name for name in bot_names if name not in existing_player_names), "Bot Omega")
+
+    # --- START OF MODIFIED LOGIC ---
+    # Find an existing UserModel for the bot, or create a new one.
+    user_repo = UserRepository(db)
+    bot_user = await user_repo.get_user_by_username(bot_name)
+
+    if not bot_user:
+        print(f"Creating a new persistent user for bot: {bot_name}")
+        bot_user = UserModel(
+            id=uuid.uuid4(),
+            username=bot_name,
+            email=f"{bot_name.lower().replace(' ', '_')}@bot.uno",
+            is_bot=True,
+            created_at=int(time.time())
+        )
+        db.add(bot_user)
+        # We commit here to ensure the user exists before creating the player
+        await db.commit() 
+        await db.refresh(bot_user)
+    else:
+        print(f"Found existing user for bot: {bot_name}")
+    # --- END OF MODIFIED LOGIC ---
+
+    # Create the Player instance for the bot
+    bot_player = Player(
+        id=uuid.uuid4(),
+        username=bot_user.username,
+        is_bot=True,
+        role=PlayerRole.PLAYER
+    )
+
+    player_repo = PlayerRepository(db)
+    # The `create_player` function will now link to the found-or-created bot_user.id
+    await player_repo.create_player(bot_player, table.id, bot_user.id)
+
+    # Broadcast the updated state
+    fresh_table = await table_repo.get_table(table.id)
+    fresh_game_state = await GameStateRepository(db).get_game_state(table.id)
+    if fresh_game_state:
+        await manager.broadcast_to_table({
+            "type": "game_state",
+            "data": fresh_game_state.to_public_dict(fresh_table)
+        }, table_id)
+
+    return {"message": f"'{bot_name}' has been added to the table."}
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

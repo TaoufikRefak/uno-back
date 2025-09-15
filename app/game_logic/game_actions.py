@@ -1,3 +1,5 @@
+from asyncio import create_task
+import asyncio
 from typing import Dict, Any, Optional
 import uuid
 from app.database.database import get_db
@@ -19,11 +21,19 @@ from app.websocket.event_handler import (
 )
 import time
 from app.session_manager import DBSessionManager
+from app.game_logic.bot_handler import check_and_handle_bot_turn
 
 
 from app.repositories.table_repository import TableRepository
 
 class GameActionHandler:
+    @staticmethod
+    async def _trigger_bot_if_needed(table_id: str): # <-- REMOVE `db` parameter
+        """Helper to create a background task for the bot handler."""
+        await asyncio.sleep(0.1) 
+        # The bot handler will now create its own database session.
+        create_task(check_and_handle_bot_turn(table_id))
+
     @staticmethod
     async def handle_play_card(
         table_id: str,
@@ -32,151 +42,116 @@ class GameActionHandler:
         chosen_color: Optional[CardColor] = None,
         db: AsyncSession = Depends(get_db)
     ) -> Dict[str, Any]:
-        # Check if player is a spectator
-        if hasattr(player, 'role') and player.role == PlayerRole.SPECTATOR:
-            return {"success": False, "error": "Spectators cannot play cards"}
         
         table_repo = TableRepository(db)
         game_state_repo = GameStateRepository(db)
-        # player_repo = PlayerRepository(db)
         
         table = await table_repo.get_table(uuid.UUID(table_id))
         game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
+
+        # 1. VALIDATION CHECKS
+        if not game_state or game_state.status != GameStatus.IN_PROGRESS:
+            return {"success": False, "error": "Game is not currently in progress."}
+        if not table:
+            return {"success": False, "error": "Table not found"}
+        if hasattr(player, 'role') and player.role == PlayerRole.SPECTATOR:
+            return {"success": False, "error": "Spectators cannot play cards"}
         
-        if not table or not game_state:
-            return {"success": False, "error": "Table or game state not found"}
-        
-        # Find the player in the table's player list
         table_player = next((p for p in table.players if p.id == player.id), None)
         if not table_player:
             return {"success": False, "error": "Player not found in table"}
         
-        # Use the table_player instance instead of the session player
-        player = table_player
-
-        # Verify it's the player's turn
         current_player = game_state.get_current_player(table)
-        if current_player.id != player.id:
+        if current_player.id != table_player.id:
             return {"success": False, "error": "Not your turn"}
 
-        # Verify the card index is valid
-        if card_index < 0 or card_index >= len(player.hand):
+        if not (0 <= card_index < len(table_player.hand)):
             return {"success": False, "error": "Invalid card index"}
 
-        card_to_play: Card = player.hand[card_index]
+        card_to_play = table_player.hand[card_index]
         top_card = game_state.get_top_discard_card()
 
-        # Verify the card can be played
-        if not top_card:
-            # First card of the game - any card can be played
-            pass
-        elif not card_to_play.is_playable_on(top_card):
-            return {"success": False, "error": f"Cannot play {card_to_play} on {top_card}"}            
+        if top_card and not card_to_play.is_playable_on(top_card):
+            return {"success": False, "error": f"Cannot play {card_to_play} on {top_card}"}
 
-        # Handle wild card color choice (must provide chosen_color for wilds)
         if card_to_play.type in (CardType.WILD, CardType.WILD_DRAW_FOUR) and not chosen_color:
-            return {"success": False, "error": "Wild card requires color choice"}
+            return {"success": False, "error": "Wild card requires a color choice"}
 
-        # Play the card
-        played_card = player.play_card(card_index)
-        if not played_card:
-            return {"success": False, "error": "Failed to play card"}
-
-        # For wild cards, set the chosen color
-        if played_card.type in (CardType.WILD, CardType.WILD_DRAW_FOUR) and chosen_color:
+        # 2. PERFORM THE ACTION
+        played_card = table_player.play_card(card_index)
+        if chosen_color:
             played_card.color = chosen_color
-
-        # Add to discard pile
-        game_state.discard_pile.append(played_card)
-
-        # Reset UNO declaration state after playing
-        player.uno_declaration = UnoDeclarationState.NOT_REQUIRED
-
-        # Broadcast card played event
-        await broadcast_card_played(
-            table_id, 
-            str(player.id), 
-            player.username, 
-            played_card,
-            len(player.hand)
-        )
         
-        # ========== KEY FIX: Handle special card effects properly ==========
-        action_result = await GameActionHandler._handle_special_card(
-            table, game_state, played_card, db # <-- Pass `db` to the helper function
-        )
-
-        # Check if player has won
-        if len(player.hand) == 0:
-            game_state.winner = player.id
-            game_state.status = GameStatus.COMPLETED
-            action_result["game_ended"] = True
-            action_result["winner"] = str(player.id)
-            action_result["message"] = f"{player.username} wins the game!"
-            
-            # Broadcast game over message
-            await manager.broadcast_to_table({
-                "type": "game_over",
-                "data": {
-                    "winner_id": str(player.id),
-                    "winner_name": player.username,
-                    "message": f"{player.username} wins the game!"
-                }
-            }, str(table.id))
-
-        # If player now has exactly 1 card, set PENDING (they must declare UNO)
-        elif len(player.hand) == 1 and game_state.status != GameStatus.COMPLETED:
-            player.uno_declaration = UnoDeclarationState.PENDING
-            await broadcast_player_one_card(table_id, str(player.id), player.username)
-
-        # ========== CRITICAL FIX: Only advance turn if not handled by special card ==========
-        if (game_state.status != GameStatus.COMPLETED and 
-            not action_result.get("turn_already_advanced", False)):
-            
-            game_state.next_turn(table)
-            
-            # Broadcast turn changed - only once per action
-            new_current_player = game_state.get_current_player(table)
-            await broadcast_turn_changed(str(table.id), str(new_current_player.id), new_current_player.username)
-
-        # Record last action
+        game_state.discard_pile.append(played_card)
+        table_player.uno_declaration = UnoDeclarationState.NOT_REQUIRED
+        
         game_state.last_action = {
             "type": "card_played",
-            "player_id": str(player.id),
-            "card": played_card.to_dict() if hasattr(played_card, "to_dict") else str(played_card),
+            "player_id": str(table_player.id),
+            "card": played_card.to_dict(),
             "timestamp": time.time()
         }
 
-        # Update database - table first, then game state
+        # 3. NOTIFY CLIENTS (Initial event)
+        await broadcast_card_played(
+            table_id, str(table_player.id), table_player.username, played_card, len(table_player.hand)
+        )
+        
+        # 4. HANDLE GAME LOGIC (Special Cards, Win Condition, Turn Advancement)
+        action_result = await GameActionHandler._handle_special_card(table, game_state, played_card, db)
+        turn_advances = action_result.pop("turn_advances", 1)
+
+        if len(table_player.hand) == 0:
+            game_state.winner = table_player.id
+            game_state.status = GameStatus.COMPLETED
+            turn_advances = 0 # Stop turn advancement on win
+            await manager.broadcast_to_table({
+                "type": "game_over",
+                "data": {"winner_id": str(table_player.id), "winner_name": table_player.username}
+            }, str(table.id))
+        elif len(table_player.hand) == 1:
+            table_player.uno_declaration = UnoDeclarationState.PENDING
+            await broadcast_player_one_card(table_id, str(table_player.id), table_player.username)
+        
+        for _ in range(turn_advances):
+            game_state.next_turn(table)
+
+        # 5. SAVE STATE TO DATABASE
         await table_repo.update_table(table)
         await game_state_repo.update_game_state(game_state)
+        
+        # 6. SYNCHRONIZE CLIENTS (Final State)
         fresh_table = await table_repo.get_table(uuid.UUID(table_id))
-
-        # Send the player's updated hand personally
         session_mgr = DBSessionManager(db)
 
-        updated_player_obj = next((p for p in fresh_table.players if p.id == player.id), None)
-
+        # Send updated hand to the player who just played
+        updated_player_obj = next((p for p in fresh_table.players if p.id == table_player.id), None)
         if updated_player_obj:
             await manager.send_to_player({
-                "type": "your_hand",
-                "data": [card.to_dict() for card in updated_player_obj.hand]
-            }, str(player.id), session_mgr)
+                "type": "your_hand", "data": [c.to_dict() for c in updated_player_obj.hand]
+            }, str(updated_player_obj.id), session_mgr)
         
-        # Also send updated hand to any player who was forced to draw
+        # Send updated hand to any player who was forced to draw
         if action_result.get("drawn_player_id"):
             drawn_player_obj = next((p for p in fresh_table.players if str(p.id) == action_result["drawn_player_id"]), None)
             if drawn_player_obj:
-                 await manager.send_to_player({
-                    "type": "your_hand",
-                    "data": [card.to_dict() for card in drawn_player_obj.hand]
+                await manager.send_to_player({
+                    "type": "your_hand", "data": [c.to_dict() for c in drawn_player_obj.hand]
                 }, str(drawn_player_obj.id), session_mgr)
 
-        # 4. Broadcast the FRESH and ACCURATE game state to everyone
+        # Broadcast the final, authoritative game state to everyone
         await manager.broadcast_to_table({
-            "type": "game_state",
-            "data": game_state.to_public_dict(fresh_table) # Use fresh_table here
+            "type": "game_state", "data": game_state.to_public_dict(fresh_table)
         }, str(table.id))
+        
+        # If the game is still going, notify whose turn it is now
+        if game_state.status == GameStatus.IN_PROGRESS:
+            new_current_player = game_state.get_current_player(fresh_table)
+            if new_current_player:
+                await broadcast_turn_changed(str(table.id), str(new_current_player.id), new_current_player.username)
+
+        # 7. TRIGGER NEXT BOT (if applicable)
+        await GameActionHandler._trigger_bot_if_needed(str(table.id))
         
         return {"success": True, **action_result}
 
@@ -185,68 +160,43 @@ class GameActionHandler:
         table: Table,
         game_state: GameState,
         card: Card,
-        chosen_color: Optional[CardColor] = None
+        db: AsyncSession  # db is needed for draw_cards_for_player
     ) -> Dict[str, Any]:
-        """Handle special card effects - COMPLETELY FIXED VERSION"""
-        result: Dict[str, Any] = {"turn_already_advanced": False}
+        """
+        Applies special card effects and returns details about the action,
+        including how many times the turn should advance. This version is robust
+        and centralizes turn advancement logic.
+        """
+        result: Dict[str, Any] = {
+            "turn_advances": 1,      # Default is to advance to the next player
+            "drawn_player_id": None, # Tracks who was forced to draw cards
+            "message": ""
+        }
         
-        if card.type == CardType.SKIP:
-            # Skip the next player - advance twice total
-            game_state.next_turn(table)  # Move to next player (who gets skipped)
-            game_state.next_turn(table)  # Move to the player after the skipped one
-            
-            result["skipped_turn"] = True
-            result["message"] = "Next player was skipped!"
-            result["turn_already_advanced"] = True
-            
-            # Broadcast the turn change here since we handled it
-            new_current_player = game_state.get_current_player(table)
-            await broadcast_turn_changed(str(table.id), str(new_current_player.id), new_current_player.username)
-
-        elif card.type == CardType.REVERSE:
-            # Reverse the game direction
+        if card.type == CardType.REVERSE:
             game_state.reverse_direction()
-            result["direction_reversed"] = True
-            
+            result["message"] = "Game direction reversed!"
+            # In a 2-player game, Reverse acts like a Skip.
             if len(table.players) == 2:
-                # In 2-player game, reverse acts like skip
-                game_state.next_turn(table)  # Skip the other player
-                result["skipped_turn"] = True
-                result["message"] = "Reverse card acts as skip in 2-player game!"
-                result["turn_already_advanced"] = True
-                
-                # Broadcast the turn change here since we handled it
-                new_current_player = game_state.get_current_player(table)
-                await broadcast_turn_changed(str(table.id), str(new_current_player.id), new_current_player.username)
-            else:
-                # In >2 player game, just reverse direction - normal turn advance will happen
-                result["message"] = "Game direction reversed!"
-                result["turn_already_advanced"] = False
+                result["turn_advances"] = 2
+                result["message"] = "Reverse card acts as a skip!"
+        
+        elif card.type == CardType.SKIP:
+            result["turn_advances"] = 2
+            result["message"] = "Next player was skipped!"
 
         elif card.type in (CardType.DRAW_TWO, CardType.WILD_DRAW_FOUR):
             draw_count = 2 if card.type == CardType.DRAW_TWO else 4
             
-            # Next player draws cards and loses their turn
+            # The next player is skipped (turn advances by 2) and draws cards.
+            result["turn_advances"] = 2 
+            
             next_player_idx = game_state.get_next_player_index(table)
             next_player = table.players[next_player_idx]
             drawn_cards = game_state.draw_cards_for_player(next_player, draw_count)
             
-            # Skip the next player's turn
-            game_state.next_turn(table)
-            game_state.next_turn(table)
-            
-            result["next_player_drew"] = len(drawn_cards)
-            result["message"] = f"Next player drew {draw_count} cards and lost their turn!"
-            result["turn_already_advanced"] = True
-            result["drawn_player_id"] = str(next_player.id) # <-- IMPORTANT: Return who drew
-
-            if card.type == CardType.WILD_DRAW_FOUR:
-                 # The played card's color is set in the calling function, no need for chosen_color here
-                 pass
-
-            # Broadcast the turn change here since we handled it
-            new_current_player = game_state.get_current_player(table)
-            await broadcast_turn_changed(str(table.id), str(new_current_player.id), new_current_player.username)
+            result["message"] = f"{next_player.username} drew {draw_count} cards and was skipped!"
+            result["drawn_player_id"] = str(next_player.id)
 
         return result
     
@@ -266,7 +216,12 @@ class GameActionHandler:
         
         table = await table_repo.get_table(uuid.UUID(table_id))
         game_state = await game_state_repo.get_game_state(uuid.UUID(table_id))
+        if not game_state or game_state.status != GameStatus.IN_PROGRESS:
+            return {"success": False, "error": "Game is not currently in progress."}
         
+        if not table:
+            return {"success": False, "error": "Table not found"}
+
         if not table or not game_state:
             return {"success": False, "error": "Table or game state not found"}
         
@@ -323,6 +278,9 @@ class GameActionHandler:
             "type": "game_state",
             "data": game_state.to_public_dict(table)
         }, str(table.id))
+
+        await GameActionHandler._trigger_bot_if_needed(str(table.id)) # <-- Pass table_id only
+
 
         return {"success": True, "drawn_count": len(drawn_cards)}
 
@@ -573,5 +531,7 @@ class GameActionHandler:
         print(f"Final current player: {current_player.username if current_player else 'NONE'}")
         print(f"Final game status: {game_state.status}")
         print(f"Final current player index: {game_state.current_player_index}\n")
+
+        await GameActionHandler._trigger_bot_if_needed(str(table.id)) # <-- Pass table_id only
 
         return {"success": True}

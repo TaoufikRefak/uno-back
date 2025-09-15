@@ -71,6 +71,7 @@ class TableRepository:
                     username=user_model.username,
                     hand=hand,
                     is_online=player_model.is_online,
+                    is_bot=user_model.is_bot, # <-- THE CRITICAL FIX
                     uno_declaration=player_model.uno_declaration,
                     role=player_model.role
                 )
@@ -151,6 +152,7 @@ class TableRepository:
                         username=user_model.username,  # Get username from UserModel
                         hand=hand,
                         is_online=player_model.is_online,
+                        is_bot=user_model.is_bot,  # <-- THE CRITICAL FIX
                         uno_declaration=player_model.uno_declaration,
                         role=player_model.role
                     )

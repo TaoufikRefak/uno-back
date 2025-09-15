@@ -31,6 +31,7 @@ class UserModel(Base):
     username = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=True)  # For local authentication
     is_active = Column(Boolean, default=True)
+    is_bot = Column(Boolean, default=False, nullable=False) # <-- ADD THIS LINE
     created_at = Column(Integer, nullable=False, default=lambda: int(time.time()))
     
     # OAuth2 fields

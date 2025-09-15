@@ -178,7 +178,9 @@ class Player(BaseModel):
     username: str
     hand: List[Card] = Field(default_factory=list)
     session_token: Optional[str] = None
-    is_online: bool = True
+    is_online: bool = True    
+    is_bot: bool = False # <-- ADD THIS LINE
+
     has_uno: bool = Field(default=False)
     uno_declaration: UnoDeclarationState = UnoDeclarationState.NOT_REQUIRED
     role: PlayerRole = PlayerRole.PLAYER  # Add this field
@@ -393,6 +395,7 @@ class GameState(BaseModel):
                 "username": player.username,
                 "hand_count": len(player.hand),
                 "is_online": player.is_online,
+                "is_bot": player.is_bot, 
                 "is_you": requesting_player and player.id == requesting_player.id,
                 "uno_declaration": player.uno_declaration.value,
                 "role": player.role.value if hasattr(player, 'role') else "player"

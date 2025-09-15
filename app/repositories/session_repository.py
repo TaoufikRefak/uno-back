@@ -59,6 +59,7 @@ class SessionRepository:
             username=user_model.username,
             hand=hand,
             is_online=player_model.is_online,
+            is_bot=user_model.is_bot, # <-- ADD FIX HERE
             uno_declaration=player_model.uno_declaration,
             role=player_model.role
         )
